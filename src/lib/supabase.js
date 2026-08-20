@@ -1,252 +1,201 @@
 import { createClient } from '@supabase/supabase-js';
+import { neon } from '@neondatabase/serverless';
 import { OFFICIAL_STUDENTS } from './studentData';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://nnihbqxzssgmzlpuutld.supabase.co';
-const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_GlczctFzltukwakvuw0MtA_2F6kkFgE';
+// --- Neon PostgreSQL (Primary Source of Truth) ---
+const neonUrl =
+  import.meta.env.VITE_DATABASE_URL ||
+  'postgresql://neondb_owner:npg_bgGmAJej68wl@ep-weathered-poetry-aziwvrb4-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require';
+export const sql = neon(neonUrl);
 
+// --- Supabase client (kept for potential Realtime; not used as data store) ---
+const supabaseUrl =
+  import.meta.env.VITE_SUPABASE_URL || 'https://nnihbqxzssgmzlpuutld.supabase.co';
+const supabaseKey =
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+  'sb_publishable_GlczctFzltukwakvuw0MtA_2F6kkFgE';
 export const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Fallback Channel for local tab synchronization if Supabase Realtime table is pending SQL migration
-const broadcastChannel = typeof window !== 'undefined' && 'BroadcastChannel' in window
-  ? new BroadcastChannel('pv_holidays_checkins')
-  : null;
+// BroadcastChannel for same-origin cross-tab refresh notifications
+export const broadcastChannel =
+  typeof window !== 'undefined' && 'BroadcastChannel' in window
+    ? new BroadcastChannel('pv_holidays_checkins')
+    : null;
 
-// Local storage key constants
-const STORAGE_SESSIONS_KEY = 'pv_holidays_sessions_v1';
-const STORAGE_CHECKINS_KEY = 'pv_holidays_checkins_v1';
-
-// Helper to get local sessions
-const getLocalSessions = () => {
-  try {
-    const raw = localStorage.getItem(STORAGE_SESSIONS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    return [];
-  }
-};
-
-// Helper to save local sessions
-const saveLocalSessions = (sessions) => {
-  try {
-    localStorage.setItem(STORAGE_SESSIONS_KEY, JSON.stringify(sessions));
-    if (broadcastChannel) broadcastChannel.postMessage({ type: 'SESSION_UPDATE' });
-  } catch (e) {}
-};
-
-// Helper to get local checkins
-const getLocalCheckins = () => {
-  try {
-    const raw = localStorage.getItem(STORAGE_CHECKINS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    return [];
-  }
-};
-
-// Helper to save local checkins
-const saveLocalCheckins = (checkins) => {
-  try {
-    localStorage.setItem(STORAGE_CHECKINS_KEY, JSON.stringify(checkins));
-    if (broadcastChannel) broadcastChannel.postMessage({ type: 'CHECKIN_UPDATE' });
-  } catch (e) {}
-};
+// NOTE: localStorage is NOT used as a data store.
+// All reads/writes go to Neon PostgreSQL so that teacher (Device A)
+// and student (Device B) share the same data without cross-device isolation.
 
 /**
- * 1. Fetch Students
+ * 1. Fetch all students from Neon DB.
+ *    Falls back to static list with FAKE IDs only for UI display.
+ *    NEVER pass fallback IDs to recordCheckin (FK violation).
  */
 export async function getStudents() {
   try {
-    const { data, error } = await supabase.from('students').select('*').order('roll_number');
-    if (!error && data && data.length > 0) {
-      return { data, error: null };
+    const rows = await sql`
+      SELECT id, roll_number, name, created_at
+      FROM students
+      ORDER BY roll_number ASC;
+    `;
+    if (rows && rows.length > 0) {
+      return { data: rows, error: null };
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[getStudents] Neon error:', e);
+  }
 
-  // Fallback to official 53 student list with generated UUIDs
-  const fallbackStudents = OFFICIAL_STUDENTS.map((s, idx) => ({
-    id: `student-uuid-${s.roll_number}`,
+  // Static fallback - IDs are fake, flagged so callers skip checkin writes
+  const fallback = OFFICIAL_STUDENTS.map((s, idx) => ({
+    id: `fallback-${s.roll_number}`,
     roll_number: s.roll_number,
     name: s.name,
-    created_at: new Date(Date.now() - (53 - idx) * 60000).toISOString()
+    created_at: new Date(Date.now() - (53 - idx) * 60000).toISOString(),
+    _isFallback: true
   }));
-
-  return { data: fallbackStudents, error: null };
+  return { data: fallback, error: null };
 }
 
 /**
- * 2. Get Active Session
+ * 2. Get currently active session from Neon DB.
  */
 export async function getActiveSession() {
   try {
-    const { data, error } = await supabase
-      .from('sessions')
-      .select('*')
-      .eq('status', 'active')
-      .order('created_at', { ascending: false })
-      .limit(1);
-
-    if (!error && data) {
-      return { data: data[0] || null, error: null };
-    }
-  } catch (e) {}
-
-  // Fallback local storage
-  const sessions = getLocalSessions();
-  const active = sessions.find(s => s.status === 'active');
-  return { data: active || null, error: null };
+    const rows = await sql`
+      SELECT id, status, created_at, ended_at
+      FROM sessions
+      WHERE status = 'active'
+      ORDER BY created_at DESC
+      LIMIT 1;
+    `;
+    return { data: rows[0] || null, error: null };
+  } catch (e) {
+    console.warn('[getActiveSession] Neon error:', e);
+    return { data: null, error: e.message };
+  }
 }
 
 /**
- * 3. Start New Session
+ * 3. Start a new session (closes any currently active one).
  */
 export async function startNewSession() {
-  const newSessionId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}`;
   const now = new Date().toISOString();
-
-  // First end any existing active session
   try {
-    await supabase.from('sessions').update({ status: 'completed', ended_at: now }).eq('status', 'active');
-  } catch (e) {}
-
-  // Update local sessions
-  const localSessions = getLocalSessions().map(s => s.status === 'active' ? { ...s, status: 'completed', ended_at: now } : s);
-  const newSession = {
-    id: newSessionId,
-    created_at: now,
-    ended_at: null,
-    status: 'active'
-  };
-
-  saveLocalSessions([newSession, ...localSessions]);
-
-  try {
-    const { data, error } = await supabase
-      .from('sessions')
-      .insert([{ id: newSessionId, status: 'active', created_at: now }])
-      .select()
-      .single();
-
-    if (!error && data) {
-      return { data, error: null };
+    await sql`
+      UPDATE sessions SET status = 'completed', ended_at = ${now}
+      WHERE status = 'active';
+    `;
+    const rows = await sql`
+      INSERT INTO sessions (status, created_at)
+      VALUES ('active', ${now})
+      RETURNING id, status, created_at, ended_at;
+    `;
+    if (rows && rows.length > 0) {
+      if (broadcastChannel) broadcastChannel.postMessage({ type: 'SESSION_UPDATE' });
+      return { data: rows[0], error: null };
     }
-  } catch (e) {}
-
-  return { data: newSession, error: null };
+    return { data: null, error: 'Insert returned no rows' };
+  } catch (e) {
+    console.error('[startNewSession] Neon error:', e);
+    return { data: null, error: e.message };
+  }
 }
 
 /**
- * 4. End Session
+ * 4. End (complete) a session.
  */
 export async function endSession(sessionId) {
   const now = new Date().toISOString();
-
-  // Local storage update
-  const localSessions = getLocalSessions().map(s => s.id === sessionId ? { ...s, status: 'completed', ended_at: now } : s);
-  saveLocalSessions(localSessions);
-
   try {
-    const { data, error } = await supabase
-      .from('sessions')
-      .update({ status: 'completed', ended_at: now })
-      .eq('id', sessionId)
-      .select()
-      .single();
-
-    if (!error && data) {
-      return { data, error: null };
-    }
-  } catch (e) {}
-
-  const updatedSession = localSessions.find(s => s.id === sessionId);
-  return { data: updatedSession, error: null };
+    const rows = await sql`
+      UPDATE sessions
+      SET status = 'completed', ended_at = ${now}
+      WHERE id = ${sessionId}
+      RETURNING id, status, created_at, ended_at;
+    `;
+    if (broadcastChannel) broadcastChannel.postMessage({ type: 'SESSION_UPDATE' });
+    return { data: rows[0] || null, error: null };
+  } catch (e) {
+    console.error('[endSession] Neon error:', e);
+    return { data: null, error: e.message };
+  }
 }
 
 /**
- * 5. Get Checkins for Session
+ * 5. Fetch all check-ins for a given session.
  */
 export async function getCheckinsForSession(sessionId) {
   if (!sessionId) return { data: [], error: null };
-
   try {
-    const { data, error } = await supabase
-      .from('checkins')
-      .select('*')
-      .eq('session_id', sessionId)
-      .order('checked_at', { ascending: false });
-
-    if (!error && data) {
-      return { data, error: null };
-    }
-  } catch (e) {}
-
-  // Local storage fallback
-  const localCheckins = getLocalCheckins().filter(c => c.session_id === sessionId);
-  return { data: localCheckins, error: null };
+    const rows = await sql`
+      SELECT id, session_id, student_id, checked_at
+      FROM checkins
+      WHERE session_id = ${sessionId}
+      ORDER BY checked_at DESC;
+    `;
+    return { data: rows, error: null };
+  } catch (e) {
+    console.warn('[getCheckinsForSession] Neon error:', e);
+    return { data: [], error: e.message };
+  }
 }
 
 /**
- * 6. Record Student Check-In
+ * 6. Record a student check-in directly in Neon DB.
+ *
+ *    studentId MUST be a real UUID from the students table.
+ *    Uses ON CONFLICT DO NOTHING for idempotent duplicate handling.
  */
 export async function recordCheckin(sessionId, studentId) {
-  if (!sessionId || !studentId) return { error: 'Invalid parameters' };
+  if (!sessionId || !studentId) {
+    return { error: 'INVALID_PARAMS' };
+  }
 
-  // Check duplicate locally first
-  const localCheckins = getLocalCheckins();
-  const existing = localCheckins.find(c => c.session_id === sessionId && c.student_id === studentId);
-  if (existing) {
-    return { error: 'DUPLICATE_CHECKIN', data: existing };
+  // Guard against fake fallback IDs (would cause FK violation)
+  if (String(studentId).startsWith('fallback-')) {
+    return {
+      error: 'DATABASE_UNAVAILABLE',
+      message: 'Student database is unreachable. Please try again in a moment.'
+    };
   }
 
   const now = new Date().toISOString();
-  const checkinId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `checkin-${Date.now()}`;
-  const newCheckin = {
-    id: checkinId,
-    session_id: sessionId,
-    student_id: studentId,
-    checked_at: now
-  };
-
-  // Try Supabase first
   try {
-    const { data, error } = await supabase
-      .from('checkins')
-      .insert([{ id: checkinId, session_id: sessionId, student_id: studentId, checked_at: now }])
-      .select()
-      .single();
-
-    if (!error && data) {
-      // Also sync to local
-      saveLocalCheckins([data, ...localCheckins]);
-      return { data, error: null };
+    const rows = await sql`
+      INSERT INTO checkins (session_id, student_id, checked_at)
+      VALUES (${sessionId}, ${studentId}, ${now})
+      ON CONFLICT (session_id, student_id) DO NOTHING
+      RETURNING id, session_id, student_id, checked_at;
+    `;
+    if (rows && rows.length > 0) {
+      if (broadcastChannel) broadcastChannel.postMessage({ type: 'CHECKIN_UPDATE' });
+      return { data: rows[0], error: null };
     }
-
-    if (error && error.code === '23505') {
+    // ON CONFLICT returned 0 rows = already checked in
+    return { error: 'DUPLICATE_CHECKIN' };
+  } catch (e) {
+    console.error('[recordCheckin] Neon error:', e);
+    const msg = e.message || '';
+    if (msg.includes('unique_session_student') || msg.includes('duplicate key')) {
       return { error: 'DUPLICATE_CHECKIN' };
     }
-  } catch (e) {}
-
-  // Save to local storage
-  saveLocalCheckins([newCheckin, ...localCheckins]);
-  return { data: newCheckin, error: null };
+    return { error: 'DB_ERROR', message: msg };
+  }
 }
 
 /**
- * 7. Get All Sessions (History)
+ * 7. Get all sessions for History page.
  */
 export async function getAllSessions() {
   try {
-    const { data, error } = await supabase
-      .from('sessions')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (!error && data && data.length > 0) {
-      return { data, error: null };
-    }
-  } catch (e) {}
-
-  const localSessions = getLocalSessions();
-  return { data: localSessions, error: null };
+    const rows = await sql`
+      SELECT id, status, created_at, ended_at
+      FROM sessions
+      ORDER BY created_at DESC;
+    `;
+    return { data: rows, error: null };
+  } catch (e) {
+    console.warn('[getAllSessions] Neon error:', e);
+    return { data: [], error: e.message };
+  }
 }
-
-export { broadcastChannel };

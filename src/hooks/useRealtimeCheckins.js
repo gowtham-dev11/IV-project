@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { supabase, getActiveSession, getStudents, getCheckinsForSession, broadcastChannel } from '../lib/supabase';
+import { broadcastChannel, getActiveSession, getStudents, getCheckinsForSession } from '../lib/supabase';
+
+const POLL_INTERVAL_MS = 3000; // Poll Neon DB every 3 seconds for live dashboard updates
 
 export function useRealtimeCheckins(onNewCheckin) {
   const [activeSession, setActiveSession] = useState(null);
@@ -8,12 +10,13 @@ export function useRealtimeCheckins(onNewCheckin) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const prevCheckinsLengthRef = useRef(0);
+  // Track previous checkin count to detect new arrivals for toast notifications
+  const prevCheckinCountRef = useRef(0);
+  // Track previous checkins to find the newest one
+  const prevCheckinIdsRef = useRef(new Set());
 
-  // Load initial dataset
   const refreshData = useCallback(async () => {
     try {
-      setLoading(true);
       const [sessionRes, studentsRes] = await Promise.all([
         getActiveSession(),
         getStudents()
@@ -30,108 +33,72 @@ export function useRealtimeCheckins(onNewCheckin) {
         const currentCheckins = checkinsRes.data || [];
         setCheckins(currentCheckins);
 
-        // Notify if new checkin detected
-        if (currentCheckins.length > prevCheckinsLengthRef.current && prevCheckinsLengthRef.current > 0) {
-          const newest = currentCheckins[0];
-          const student = allStudents.find(s => s.id === newest.student_id);
-          if (student && onNewCheckin) {
-            onNewCheckin(student);
+        // Detect newly arrived check-ins for toast notification
+        if (currentCheckins.length > prevCheckinCountRef.current && prevCheckinCountRef.current > 0) {
+          const prevIds = prevCheckinIdsRef.current;
+          const newOnes = currentCheckins.filter(c => !prevIds.has(c.id));
+          if (newOnes.length > 0 && onNewCheckin) {
+            // Find the student record for the most recent new check-in
+            const newest = newOnes[0];
+            const student = allStudents.find(s => s.id === newest.student_id);
+            if (student) onNewCheckin(student);
           }
         }
-        prevCheckinsLengthRef.current = currentCheckins.length;
+        prevCheckinCountRef.current = currentCheckins.length;
+        prevCheckinIdsRef.current = new Set(currentCheckins.map(c => c.id));
       } else {
         setCheckins([]);
-        prevCheckinsLengthRef.current = 0;
+        prevCheckinCountRef.current = 0;
+        prevCheckinIdsRef.current = new Set();
       }
     } catch (err) {
-      console.error('Error refreshing check-in data:', err);
+      console.error('[useRealtimeCheckins] refreshData error:', err);
       setError(err.message || 'Failed to fetch check-in status');
     } finally {
       setLoading(false);
     }
   }, [onNewCheckin]);
 
+  // Initial load
   useEffect(() => {
     refreshData();
   }, [refreshData]);
 
-  // Subscribe to Supabase Realtime & BroadcastChannel
+  // Polling loop — fires every 3s while page is open
   useEffect(() => {
-    if (!activeSession) return;
+    const interval = setInterval(refreshData, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [refreshData]);
 
-    // 1. Supabase Realtime Channel
-    const channel = supabase
-      .channel(`public:checkins:${activeSession.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'checkins',
-          filter: `session_id=eq.${activeSession.id}`
-        },
-        (payload) => {
-          const newCheckin = payload.new;
-          setCheckins((prev) => {
-            if (prev.some((c) => c.id === newCheckin.id || c.student_id === newCheckin.student_id)) {
-              return prev;
-            }
-            const updated = [newCheckin, ...prev];
-            const student = students.find((s) => s.id === newCheckin.student_id);
-            if (student && onNewCheckin) {
-              onNewCheckin(student);
-            }
-            return updated;
-          });
-        }
-      )
-      .subscribe();
+  // BroadcastChannel: get instant notification when something changes on same device
+  useEffect(() => {
+    if (!broadcastChannel) return;
 
-    // 2. BroadcastChannel tab listener
     const handleBroadcast = (event) => {
-      if (event.data?.type === 'CHECKIN_UPDATE' || event.data?.type === 'SESSION_UPDATE') {
+      const type = event.data?.type;
+      if (type === 'CHECKIN_UPDATE' || type === 'SESSION_UPDATE') {
         refreshData();
       }
     };
 
-    if (broadcastChannel) {
-      broadcastChannel.addEventListener('message', handleBroadcast);
-    }
+    broadcastChannel.addEventListener('message', handleBroadcast);
+    return () => broadcastChannel.removeEventListener('message', handleBroadcast);
+  }, [refreshData]);
 
-    // 3. Storage event listener for cross-tab sync
-    const handleStorageChange = (e) => {
-      if (e.key === 'pv_holidays_checkins_v1' || e.key === 'pv_holidays_sessions_v1') {
-        refreshData();
-      }
-    };
-    window.addEventListener('storage', handleStorageChange);
+  // Compute derived state
+  const checkedInStudentIds = new Set(checkins.map(c => c.student_id));
 
-    return () => {
-      supabase.removeChannel(channel);
-      if (broadcastChannel) {
-        broadcastChannel.removeEventListener('message', handleBroadcast);
-      }
-      window.removeEventListener('storage', handleStorageChange);
-    };
-  }, [activeSession, students, onNewCheckin, refreshData]);
-
-  // Compute derived state: Checked In vs Remaining Students
-  const checkedInStudentIds = new Set(checkins.map((c) => c.student_id));
-  
   const checkedInStudents = students
-    .filter((s) => checkedInStudentIds.has(s.id))
-    .map((s) => {
-      const c = checkins.find((item) => item.student_id === s.id);
-      return {
-        ...s,
-        checked_at: c ? c.checked_at : null
-      };
+    .filter(s => checkedInStudentIds.has(s.id))
+    .map(s => {
+      const c = checkins.find(item => item.student_id === s.id);
+      return { ...s, checked_at: c ? c.checked_at : null };
     })
     .sort((a, b) => new Date(b.checked_at || 0) - new Date(a.checked_at || 0));
 
   const remainingStudents = students
-    .filter((s) => !checkedInStudentIds.has(s.id))
-    .sort((a, b) => a.roll_number.localeCompare(b.roll_number));
+    .filter(s => !checkedInStudentIds.has(s.id))
+    .sort((a, b) => String(a.roll_number).localeCompare(String(b.roll_number)));
 
   return {
     activeSession,
@@ -139,7 +106,7 @@ export function useRealtimeCheckins(onNewCheckin) {
     checkins,
     checkedInStudents,
     remainingStudents,
-    totalCount: students.length,
+    totalCount: students.filter(s => !s._isFallback || true).length,
     checkedInCount: checkedInStudents.length,
     remainingCount: remainingStudents.length,
     loading,

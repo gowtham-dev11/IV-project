@@ -1,9 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { CheckCircle2, AlertCircle, AlertTriangle, RefreshCw, Compass, ArrowLeft } from 'lucide-react';
+import { CheckCircle2, AlertCircle, AlertTriangle, RefreshCw, Compass, ArrowLeft, WifiOff } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { getActiveSession, getStudents, getCheckinsForSession, recordCheckin } from '../lib/supabase';
+import { getActiveSession, getStudents, recordCheckin } from '../lib/supabase';
 import { sanitizeRollNumber } from '../utils/validation';
+
+// Poll every 5 seconds on the student page to detect when a session becomes active
+const SESSION_POLL_INTERVAL_MS = 5000;
 
 export function Student() {
   const [rollNumber, setRollNumber] = useState('');
@@ -11,9 +14,12 @@ export function Student() {
   const [submitting, setSubmitting] = useState(false);
   const [activeSession, setActiveSession] = useState(null);
   const [students, setStudents] = useState([]);
-  const [statusState, setStatusState] = useState('IDLE'); // IDLE, NO_SESSION, INVALID_ROLL, ALREADY_CHECKED, SUCCESS
+  const [statusState, setStatusState] = useState('IDLE'); // IDLE | NO_SESSION | INVALID_ROLL | ALREADY_CHECKED | SUCCESS | DB_ERROR
   const [matchedStudent, setMatchedStudent] = useState(null);
+  const [errorMessage, setErrorMessage] = useState('');
+  const pollRef = useRef(null);
 
+  // Fetch session + students from Neon DB (independent of teacher device)
   const fetchSessionAndStudents = async () => {
     setLoading(true);
     try {
@@ -31,19 +37,48 @@ export function Student() {
       if (!session) {
         setStatusState('NO_SESSION');
       } else {
-        await getCheckinsForSession(session.id);
         setStatusState('IDLE');
       }
     } catch (err) {
-      console.error('Error initializing student check-in:', err);
+      console.error('[Student] fetchSessionAndStudents error:', err);
+      setStatusState('IDLE'); // Don't block UI on network error
     } finally {
       setLoading(false);
     }
   };
 
+  // Initial load
   useEffect(() => {
     fetchSessionAndStudents();
   }, []);
+
+  // Poll every 5s so students automatically see when teacher starts a session
+  useEffect(() => {
+    // Only poll if no active session or not in a terminal state
+    if (statusState === 'SUCCESS' || statusState === 'ALREADY_CHECKED') return;
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const sessionRes = await getActiveSession();
+        const session = sessionRes.data;
+        setActiveSession(prev => {
+          // If session just became active, update state
+          if (!prev && session) {
+            setStatusState('IDLE');
+          } else if (prev && !session) {
+            setStatusState('NO_SESSION');
+          }
+          return session;
+        });
+      } catch (e) {
+        // Ignore polling errors
+      }
+    }, SESSION_POLL_INTERVAL_MS);
+
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [statusState]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -51,9 +86,10 @@ export function Student() {
     if (!cleanRoll) return;
 
     setSubmitting(true);
+    setErrorMessage('');
 
     try {
-      // 1. Check active session
+      // 1. Re-fetch active session from Neon DB (not from React state which could be stale)
       const { data: latestSession } = await getActiveSession();
       if (!latestSession || latestSession.status !== 'active') {
         setActiveSession(null);
@@ -63,9 +99,17 @@ export function Student() {
       }
       setActiveSession(latestSession);
 
-      // 2. Validate roll number
-      const foundStudent = students.find(
-        (s) => String(s.roll_number).toLowerCase() === cleanRoll.toLowerCase()
+      // 2. Validate roll number against the students from Neon DB
+      //    Re-use cached students; if empty, re-fetch
+      let studentList = students;
+      if (!studentList || studentList.length === 0) {
+        const studentsRes = await getStudents();
+        studentList = studentsRes.data || [];
+        setStudents(studentList);
+      }
+
+      const foundStudent = studentList.find(
+        s => String(s.roll_number).toLowerCase() === cleanRoll.toLowerCase()
       );
 
       if (!foundStudent) {
@@ -76,30 +120,39 @@ export function Student() {
 
       setMatchedStudent(foundStudent);
 
-      // 3. Check duplicate
-      const { data: currentCheckins } = await getCheckinsForSession(latestSession.id);
-      const isAlreadyChecked = (currentCheckins || []).some(
-        (c) => c.student_id === foundStudent.id
-      );
-
-      if (isAlreadyChecked) {
-        setStatusState('ALREADY_CHECKED');
+      // 3. Guard against fallback IDs (DB unreachable scenario)
+      if (foundStudent._isFallback) {
+        setStatusState('DB_ERROR');
+        setErrorMessage('Student records are unavailable. Please try again in a moment.');
         setSubmitting(false);
         return;
       }
 
-      // 4. Record checkin
+      // 4. Record check-in via Neon DB
       const res = await recordCheckin(latestSession.id, foundStudent.id);
+
       if (res.error === 'DUPLICATE_CHECKIN') {
         setStatusState('ALREADY_CHECKED');
+      } else if (res.error === 'DATABASE_UNAVAILABLE') {
+        setStatusState('DB_ERROR');
+        setErrorMessage(res.message || 'Database is currently unreachable. Try again shortly.');
+      } else if (res.error === 'DB_ERROR') {
+        setStatusState('DB_ERROR');
+        setErrorMessage(res.message || 'A database error occurred. Please try again.');
       } else if (res.data) {
         setStatusState('SUCCESS');
+        // Stop polling — student is done
+        if (pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
       } else {
         setStatusState('INVALID_ROLL');
       }
     } catch (err) {
-      console.error('Checkin error:', err);
-      setStatusState('INVALID_ROLL');
+      console.error('[Student] handleSubmit error:', err);
+      setStatusState('DB_ERROR');
+      setErrorMessage('An unexpected error occurred. Please try again.');
     } finally {
       setSubmitting(false);
     }
@@ -108,6 +161,7 @@ export function Student() {
   const handleReset = () => {
     setRollNumber('');
     setMatchedStudent(null);
+    setErrorMessage('');
     if (!activeSession) {
       setStatusState('NO_SESSION');
     } else {
@@ -129,8 +183,8 @@ export function Student() {
           </div>
         </Link>
 
-        <Link 
-          to="/" 
+        <Link
+          to="/"
           className="p-2 min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl bg-slate-900 border border-slate-800 text-slate-400 hover:text-white transition-colors active:scale-95"
           aria-label="Back to home"
         >
@@ -142,6 +196,7 @@ export function Student() {
       <main className="max-w-md w-full mx-auto my-auto py-4 sm:py-6">
         <AnimatePresence mode="wait">
           {loading ? (
+            /* LOADING */
             <motion.div
               key="loading"
               initial={{ opacity: 0 }}
@@ -150,7 +205,7 @@ export function Student() {
               className="glass-panel rounded-3xl p-6 sm:p-8 text-center border border-slate-800"
             >
               <div className="w-9 h-9 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mx-auto mb-3" />
-              <p className="text-xs sm:text-sm font-semibold text-slate-400">Verifying session status...</p>
+              <p className="text-xs sm:text-sm font-semibold text-slate-400">Checking session status...</p>
             </motion.div>
           ) : statusState === 'NO_SESSION' ? (
             /* NO ACTIVE SESSION */
@@ -170,13 +225,16 @@ export function Student() {
               <p className="text-xs sm:text-sm text-slate-300 mt-2 font-medium leading-relaxed">
                 Please wait for your teacher to start a check-in session.
               </p>
+              <p className="text-[10px] text-slate-500 mt-1 font-medium">
+                This page checks automatically every few seconds.
+              </p>
 
               <button
                 onClick={fetchSessionAndStudents}
                 className="mt-6 w-full min-h-[48px] py-3.5 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-white font-bold text-xs tracking-wider uppercase border border-slate-700 transition-all flex items-center justify-center gap-2"
               >
                 <RefreshCw className="w-4 h-4" />
-                REFRESH STATUS
+                REFRESH NOW
               </button>
             </motion.div>
           ) : statusState === 'INVALID_ROLL' ? (
@@ -193,9 +251,9 @@ export function Student() {
                 <AlertCircle className="w-6 h-6 sm:w-7 sm:h-7" />
               </div>
 
-              <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">Invalid Roll Number</h2>
+              <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">Student Not Found</h2>
               <p className="text-xs sm:text-sm text-slate-300 mt-2 font-medium leading-relaxed">
-                We couldn't find this roll number. Please check and try again.
+                Roll number <span className="font-mono font-bold text-rose-400">{rollNumber}</span> is not in the official list. Please check and try again.
               </p>
 
               <button
@@ -227,7 +285,7 @@ export function Student() {
               </div>
 
               <p className="text-xs text-slate-300 font-medium leading-relaxed">
-                You are already recorded for this check-in.
+                You are already recorded for this check-in session.
               </p>
 
               <button
@@ -235,6 +293,32 @@ export function Student() {
                 className="mt-6 w-full min-h-[48px] py-3.5 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-white font-bold text-xs tracking-wider uppercase border border-slate-700 transition-all"
               >
                 DONE
+              </button>
+            </motion.div>
+          ) : statusState === 'DB_ERROR' ? (
+            /* DATABASE ERROR */
+            <motion.div
+              key="db-error"
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              transition={{ duration: 0.15 }}
+              className="glass-panel rounded-3xl p-6 sm:p-8 text-center border border-rose-500/30 bg-gradient-to-b from-slate-900/90 to-rose-950/20 shadow-2xl"
+            >
+              <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-400 flex items-center justify-center mx-auto mb-4 shrink-0">
+                <WifiOff className="w-6 h-6 sm:w-7 sm:h-7" />
+              </div>
+
+              <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">Connection Issue</h2>
+              <p className="text-xs sm:text-sm text-slate-300 mt-2 font-medium leading-relaxed">
+                {errorMessage || 'Could not reach the database. Please check your connection and try again.'}
+              </p>
+
+              <button
+                onClick={handleReset}
+                className="mt-6 w-full min-h-[48px] py-3.5 rounded-2xl bg-rose-600 hover:bg-rose-500 active:scale-[0.98] text-white font-extrabold text-xs tracking-wider uppercase shadow-lg shadow-rose-600/30 transition-all"
+              >
+                TRY AGAIN
               </button>
             </motion.div>
           ) : statusState === 'SUCCESS' ? (
@@ -252,7 +336,7 @@ export function Student() {
               </div>
 
               <h2 className="text-xl sm:text-2xl font-extrabold text-emerald-400 tracking-tight flex items-center justify-center gap-2">
-                ✓ You're Checked In
+                You're Checked In!
               </h2>
 
               <div className="my-4 sm:my-5 p-3.5 sm:p-4 rounded-2xl bg-slate-950/80 border border-emerald-500/30 shadow-inner">
@@ -262,12 +346,8 @@ export function Student() {
                 </p>
               </div>
 
-              <p className="text-xs sm:text-sm font-bold text-emerald-300">
-                Successfully recorded.
-              </p>
-              <p className="text-[11px] sm:text-xs text-slate-400 mt-1">
-                You can close this page.
-              </p>
+              <p className="text-xs sm:text-sm font-bold text-emerald-300">Successfully recorded.</p>
+              <p className="text-[11px] sm:text-xs text-slate-400 mt-1">You can close this page.</p>
 
               <button
                 onClick={handleReset}
@@ -277,7 +357,7 @@ export function Student() {
               </button>
             </motion.div>
           ) : (
-            /* DEFAULT FORM STATE */
+            /* DEFAULT FORM STATE — IDLE with active session */
             <motion.div
               key="form"
               initial={{ opacity: 0, y: 8 }}
@@ -291,13 +371,13 @@ export function Student() {
                   Session Active
                 </span>
                 <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">Student Check-In</h2>
-                <p className="text-xs text-slate-400 mt-1 font-medium">Enter your Roll Number to record attendance.</p>
+                <p className="text-xs text-slate-400 mt-1 font-medium">Enter your Roll Number to record your attendance.</p>
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-5">
                 <div>
                   <label htmlFor="rollNumber" className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
-                    Enter your Roll Number
+                    Your Roll Number
                   </label>
                   <input
                     id="rollNumber"
@@ -305,6 +385,7 @@ export function Student() {
                     inputMode="numeric"
                     pattern="[0-9]*"
                     required
+                    autoComplete="off"
                     value={rollNumber}
                     onChange={(e) => setRollNumber(e.target.value)}
                     placeholder="e.g. 279005"
